@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import statistics
 import timeit
 from dataclasses import dataclass
+from collections.abc import Iterator
 
 import torch
 import torch.nn.functional as F
@@ -58,6 +60,19 @@ def synchronize(device: torch.device) -> None:
         torch.cuda.synchronize(device)
 
 
+@contextlib.contextmanager
+def nvtx_range(name: str, device: torch.device) -> Iterator[None]:
+    if device.type != "cuda":
+        yield
+        return
+
+    torch.cuda.nvtx.range_push(name)
+    try:
+        yield
+    finally:
+        torch.cuda.nvtx.range_pop()
+
+
 def format_gib(num_bytes: int | float) -> str:
     return f"{num_bytes / 1024**3:.2f}"
 
@@ -88,11 +103,6 @@ def build_model(
     )
 
 
-def compute_loss(model: TransformerLM, x: torch.Tensor, y: torch.Tensor, vocab_size: int) -> torch.Tensor:
-    logits = model(x)
-    return F.cross_entropy(logits.reshape(-1, vocab_size).float(), y.reshape(-1))
-
-
 def benchmark_mode(
     *,
     model: TransformerLM,
@@ -110,27 +120,38 @@ def benchmark_mode(
 
     def run_step() -> None:
         if mode == "forward":
-            _ = model(x)
+            with nvtx_range("forward", device):
+                _ = model(x)
             return
 
         assert optimizer is not None
         optimizer.zero_grad(set_to_none=True)
-        loss = compute_loss(model, x, y, vocab_size)
-        loss.backward()
+        with nvtx_range("forward", device):
+            logits = model(x)
+        with nvtx_range("loss", device):
+            loss = F.cross_entropy(logits.reshape(-1, vocab_size).float(), y.reshape(-1))
+        with nvtx_range("backward", device):
+            loss.backward()
         if mode == "full":
-            optimizer.step()
+            with nvtx_range("optimizer_step", device):
+                optimizer.step()
 
     for _ in range(warmup):
-        run_step()
-        synchronize(device)
+        with nvtx_range("warmup", device):
+            run_step()
+            synchronize(device)
 
     timings: list[float] = []
-    for _ in range(steps):
+    synchronize(device)
+    with nvtx_range("benchmark", device):
+        for step in range(steps):
+            synchronize(device)
+            start = timeit.default_timer()
+            with nvtx_range(f"step_{step}", device):
+                run_step()
+            synchronize(device)
+            timings.append(timeit.default_timer() - start)
         synchronize(device)
-        start = timeit.default_timer()
-        run_step()
-        synchronize(device)
-        timings.append(timeit.default_timer() - start)
     return timings
 
 
