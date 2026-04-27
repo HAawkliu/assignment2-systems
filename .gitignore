@@ -5,6 +5,9 @@ test_results.xml
 # training data
 data/owt*
 data/TinyStories*
+*npy
+data/checkpoint/
+
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
